@@ -1,7 +1,5 @@
-# final_training_fixed.py
 import torch
 import torch.nn as nn
-#import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.swa_utils import AveragedModel
 from torch.utils.data import DataLoader, random_split, Subset
@@ -12,6 +10,9 @@ import numpy as np
 from sklearn.metrics import precision_score, recall_score
 import os
 import time
+from torch.utils.data import Dataset, DataLoader, random_split, Subset
+# В начале файла, после импортов:
+from torch.amp import autocast, GradScaler
 
 # ========== ДИАГНОСТИКА GPU ==========
 print("=" * 60)
@@ -136,11 +137,17 @@ class ResNet50(nn.Module):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                  nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, 0, 0.01)
+                # Для выходного слоя std больше
+                if m is self.fc:
+                    nn.init.normal_(m.weight, 0, 0.1)  # std=0.1 для 120 классов
+                else:
+                    nn.init.normal_(m.weight, 0, 0.01)  # std=0.01 для других Linear
                 nn.init.constant_(m.bias, 0)
 
         # Zero-initialize последний BatchNorm в каждом residual branch
@@ -184,83 +191,77 @@ def setup_environment():
 
 
 def prepare_dataloaders_smart(data_dir, batch_size=256, max_images=12000):
+    # Трансформации
     IMAGENET_MEAN = [0.485, 0.456, 0.406]
     IMAGENET_STD = [0.229, 0.224, 0.225]
 
-    # Загружаем ОДИН датасет без трансформаций
-    full_dataset = ImageFolder(
-        root=os.path.join(data_dir, 'Images'),
-        transform=None  # Пока без трансформаций
-    )
+    # Для модели ResNet50 с нуля поменяли Resize с 256 до 512
+    # Кроме того, поменяли CenterCrop с 224 на 448 для этой же необученной модели
+    # Для обученных моделей Resize и CenterCrop были другими
+    transform_train = transforms.Compose([
+        transforms.Resize(512),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(5),
+        transforms.CenterCrop(448),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+    ])
 
-    # Ограничиваем количество
-    if len(full_dataset) > max_images:
-        indices = torch.randperm(len(full_dataset))[:max_images]
-        dataset = Subset(full_dataset, indices)
-        print(f"  Используется {max_images} изображений")
-    else:
-        dataset = full_dataset
+    transform_test = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+    ])
 
-    # Разделяем на train/val/test
-    total_size = len(dataset)
-    train_size = int(0.7 * total_size)
-    val_size = int(0.15 * total_size)
-    test_size = total_size - train_size - val_size
+    # Загружаем базовый датасет
+    base_dataset = ImageFolder(os.path.join(data_dir, 'Images'))
 
-    # ВАЖНО: seed для воспроизводимости
+    # Ограничиваем
+    if len(base_dataset) > max_images:
+        indices = torch.randperm(len(base_dataset))[:max_images]
+        base_dataset = Subset(base_dataset, indices)
+
+    # Разделяем индексы
+    train_size = int(0.7 * len(base_dataset))
+    val_size = int(0.15 * len(base_dataset))
+    test_size = len(base_dataset) - train_size - val_size
+
     generator = torch.Generator().manual_seed(42)
     train_indices, val_indices, test_indices = random_split(
-        range(total_size),
+        range(len(base_dataset)),
         [train_size, val_size, test_size],
         generator=generator
     )
 
-    # Создаем разные трансформации
-    transform_train = transforms.Compose([
-        transforms.Resize(128),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.CenterCrop(112),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
-    ])
-
-    transform_val_test = transforms.Compose([
-        transforms.Resize(128),
-        transforms.CenterCrop(112),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
-    ])
-
-    # Создаем подмножества с разными трансформациями
-    class TransformedSubset(Subset):
-        """Подмножество с своей трансформацией"""
-
-        def __init__(self, dataset, indices, transform=None):
-            super().__init__(dataset, indices)
+    # Кастомный DatasetWrapper
+    class DatasetWrapper(Dataset):
+        def __init__(self, base_dataset, indices, transform):
+            self.base_dataset = base_dataset
+            self.indices = list(indices)
             self.transform = transform
 
+        def __len__(self):
+            return len(self.indices)
+
         def __getitem__(self, idx):
-            x, y = self.dataset[self.indices[idx]]
+            real_idx = self.indices[idx]
+            img, label = self.base_dataset[real_idx]
             if self.transform:
-                x = self.transform(x)
-            return x, y
+                img = self.transform(img)
+            return img, label
 
-    train_dataset = TransformedSubset(full_dataset, train_indices, transform_train)
-    val_dataset = TransformedSubset(full_dataset, val_indices, transform_val_test)
-    test_dataset = TransformedSubset(full_dataset, test_indices, transform_val_test)
+    # Создаем три независимых датасета
+    train_dataset = DatasetWrapper(base_dataset, train_indices.indices, transform_train)
+    val_dataset = DatasetWrapper(base_dataset, val_indices.indices, transform_test)
+    test_dataset = DatasetWrapper(base_dataset, test_indices.indices, transform_test)
 
-    # Создаем DataLoader
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                            num_workers=2, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
-                             num_workers=2, pin_memory=True)
+    # DataLoader
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, persistent_workers = True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, persistent_workers = True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, persistent_workers = True)
 
-    print(f"Классов: {len(full_dataset.classes)}")
-    print(f"Данные: Train={len(train_dataset)}, Val={len(val_dataset)}, Test={len(test_dataset)}")
-
-    return train_loader, val_loader, test_loader, full_dataset.classes
+    return train_loader, val_loader, test_loader, base_dataset.dataset.classes
 
 
 def create_model(pretrained=True, num_classes=120, device=None):
@@ -315,9 +316,22 @@ def calculate_metrics(model, data_loader, device):
 
 
 def train_model_unified(model, train_loader, val_loader, device,
-                        use_swa=False, num_epochs=30, is_pretrained=True):
+                               use_swa=False, num_epochs=30, is_pretrained=True):
+    """
+    Упрощенная версия с правильным fine-tuning и Mixed Precision
+    Только StepLR, без косинусного аннигинга
+    Первые слои (conv1, layer1, layer2) заморожены для предобученных моделей
+    """
 
     criterion = nn.CrossEntropyLoss().to(device)
+
+    # Проверьте:
+    print(f"Model device: {next(model.parameters()).device}")
+    print(f"Batch size: {train_loader.batch_size}")
+
+    # Mixed Precision Training для ускорения GPU
+    scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
+    print(f"   Mixed Precision: {'ВКЛЮЧЕНО' if scaler else 'ОТКЛЮЧЕНО (нет GPU)'}")
 
     if is_pretrained:
         print("=" * 60)
@@ -329,8 +343,8 @@ def train_model_unified(model, train_loader, val_loader, device,
         for param in model.parameters():
             param.requires_grad = False
 
-        # === ФАЗА 1: Обучение только классификатора (5 эпох) ===
-        print("\nФаза 1: Обучение только классификатора (5 эпох)")
+        # === ФАЗА 1: Обучение только классификатора (8 эпох) ===
+        print("\nФаза 1: Обучение только классификатора (8 эпох)")
         print("   Обучается: fc (классификатор)")
         print("   Все остальные слои заморожены")
 
@@ -338,27 +352,52 @@ def train_model_unified(model, train_loader, val_loader, device,
         for param in model.fc.parameters():
             param.requires_grad = True
 
-        optimizer = optim.Adam(model.fc.parameters(), lr=0.01)
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.5)
+        optimizer = optim.Adam(model.fc.parameters(), lr=0.002, weight_decay=0.01)
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.65)
 
-        for epoch in range(5):
+        for epoch in range(8):
             model.train()
             total_loss = 0
+            epoch_start = time.time()
 
             for inputs, labels in train_loader:
-                inputs, labels = inputs.to(device), labels.to(device)
+                inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
                 optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
+
+                # Mixed precision forward
+                if scaler:
+                    with torch.amp.autocast('cuda'):
+                        outputs = model(inputs)
+                        loss = criterion(outputs, labels)
+
+                    # Mixed precision backward
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+                    loss.backward()
+                    optimizer.step()
+
                 total_loss += loss.item()
 
             scheduler.step()
+            epoch_time = time.time() - epoch_start
             val_acc, _, _ = calculate_metrics(model, val_loader, device)
-            print(f"   Эпоха {epoch + 1:2d}: "
-                  f"Loss={total_loss / len(train_loader):.4f}, "
-                  f"Val Acc={val_acc:.4f}")
+
+            if torch.cuda.is_available():
+                memory_used = torch.cuda.memory_allocated() / 1e9
+                print(f"   Эпоха {epoch+1:2d}: "
+                      f"Loss={total_loss/len(train_loader):.4f}, "
+                      f"Val Acc={val_acc:.4f}, "
+                      f"Время={epoch_time:.1f}с, "
+                      f"GPU={memory_used:.2f}GB")
+            else:
+                print(f"   Эпоха {epoch+1:2d}: "
+                      f"Loss={total_loss/len(train_loader):.4f}, "
+                      f"Val Acc={val_acc:.4f}, "
+                      f"Время={epoch_time:.1f}с")
 
         # === ФАЗА 2: Размораживаем layer4 (10 эпох) ===
         print("\nФаза 2: Размораживаем layer4 (10 эпох)")
@@ -371,31 +410,58 @@ def train_model_unified(model, train_loader, val_loader, device,
 
         # Оптимизатор для layer4 + fc
         trainable_params = filter(lambda p: p.requires_grad, model.parameters())
-        optimizer = optim.Adam(trainable_params, lr=0.001)
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.5)
+        optimizer = optim.Adam([
+            {'params': model.fc.parameters(), 'lr': 0.0001},
+            {'params': model.layer4.parameters(), 'lr': 0.00002}  # В 5 раз меньше!
+        ], weight_decay=0.001)
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=6, gamma=0.75)
 
         for epoch in range(10):
             model.train()
             total_loss = 0
+            epoch_start = time.time()
 
             for inputs, labels in train_loader:
-                inputs, labels = inputs.to(device), labels.to(device)
+                inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
                 optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
+
+                # Mixed precision
+                if scaler:
+                    with torch.amp.autocast('cuda'):
+                        outputs = model(inputs)
+                        loss = criterion(outputs, labels)
+
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+                    loss.backward()
+                    optimizer.step()
+
                 total_loss += loss.item()
 
             scheduler.step()
+            epoch_time = time.time() - epoch_start
             val_acc, _, _ = calculate_metrics(model, val_loader, device)
-            print(f"   Эпоха {epoch + 6:2d}: "
-                  f"Loss={total_loss / len(train_loader):.4f}, "
-                  f"Val Acc={val_acc:.4f}")
+
+            if torch.cuda.is_available():
+                memory_used = torch.cuda.memory_allocated() / 1e9
+                print(f"   Эпоха {epoch+9:2d}: "
+                      f"Loss={total_loss/len(train_loader):.4f}, "
+                      f"Val Acc={val_acc:.4f}, "
+                      f"Время={epoch_time:.1f}с, "
+                      f"GPU={memory_used:.2f}GB")
+            else:
+                print(f"   Эпоха {epoch+9:2d}: "
+                      f"Loss={total_loss/len(train_loader):.4f}, "
+                      f"Val Acc={val_acc:.4f}, "
+                      f"Время={epoch_time:.1f}с")
 
         # === ФАЗА 3: Размораживаем layer3 (если данных достаточно) ===
-        dataset_size = len(train_loader.dataset)
-        remaining_epochs = num_epochs - 15
+        dataset_size = len(train_loader.dataset.base_dataset)
+        remaining_epochs = num_epochs - 18
 
         if dataset_size > 10000:  # Для Stanford Dogs (20k) - размораживаем
             print(f"\nФаза 3: Размораживаем layer3 ({remaining_epochs} эпох)")
@@ -408,15 +474,15 @@ def train_model_unified(model, train_loader, val_loader, device,
 
             # Новый оптимизатор для layer3 + layer4 + fc
             trainable_params = filter(lambda p: p.requires_grad, model.parameters())
-            optimizer = optim.Adam(trainable_params, lr=0.0001)  # Меньший LR для layer3
-            scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+            optimizer = optim.Adam(trainable_params, lr=0.0001, weight_decay=0.01)  # Меньший LR для layer3
+            scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=12, gamma=0.85)
 
         else:
             print(f"\nФаза 3: Продолжаем обучение layer4 + fc ({remaining_epochs} эпох)")
             print("   Обучаются: layer4, fc")
             print("   Заморожены: conv1, layer1, layer2, layer3")
             # Оптимизатор остаётся тот же (только layer4 + fc)
-            scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+            scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.85)
 
     else:  # Обучение с нуля
         print("=" * 50)
@@ -426,8 +492,8 @@ def train_model_unified(model, train_loader, val_loader, device,
         for param in model.parameters():
             param.requires_grad = True
 
-        optimizer = optim.Adam(model.parameters(), lr=0.01)
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=0.0001)
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.5)
         remaining_epochs = num_epochs
 
     # === ОБЩАЯ ФАЗА ОБУЧЕНИЯ ===
@@ -451,15 +517,30 @@ def train_model_unified(model, train_loader, val_loader, device,
     for epoch in range(remaining_epochs):
         model.train()
         total_loss = 0
+        epoch_start = time.time()
 
         for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
+            inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+
+            # Mixed precision
+            if scaler:
+                with torch.amp.autocast('cuda'):
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+
             total_loss += loss.item()
+
+        epoch_time = time.time() - epoch_start
 
         # SWA обновление
         if use_swa and swa_model and (epoch >= swa_start):
@@ -472,15 +553,25 @@ def train_model_unified(model, train_loader, val_loader, device,
         # Валидация
         val_acc, _, _ = calculate_metrics(model, val_loader, device)
 
-        print(f"   Эпоха {epoch + 1:3d}: "
-              f"Loss={total_loss / len(train_loader):.4f}, "
-              f"Val Acc={val_acc:.4f}, "
-              f"LR={current_lr:.6f}")
+        if torch.cuda.is_available():
+            memory_used = torch.cuda.memory_allocated() / 1e9
+            print(f"   Эпоха {epoch+1:3d}: "
+                  f"Loss={total_loss/len(train_loader):.4f}, "
+                  f"Val Acc={val_acc:.4f}, "
+                  f"LR={current_lr:.6f}, "
+                  f"Время={epoch_time:.1f}с, "
+                  f"GPU={memory_used:.2f}GB")
+        else:
+            print(f"   Эпоха {epoch+1:3d}: "
+                  f"Loss={total_loss/len(train_loader):.4f}, "
+                  f"Val Acc={val_acc:.4f}, "
+                  f"LR={current_lr:.6f}, "
+                  f"Время={epoch_time:.1f}с")
 
     # Финальная обработка SWA
     if use_swa and swa_model:
         torch.optim.swa_utils.update_bn(train_loader, swa_model, device=device)
-        print(" SWA модель готова")
+        print("✅ SWA модель готова")
         return swa_model
 
     return model
@@ -493,13 +584,11 @@ def main():
 
     total_start = time.time()
     device, data_dir = setup_environment()
-    BATCH_SIZE = 256 # Для GPU нормально
+    BATCH_SIZE = 64 # Для необученной модели нормально
 
     train_loader, val_loader, test_loader, classes = prepare_dataloaders_smart(data_dir, batch_size=BATCH_SIZE, max_images=12000)
 
-    results = {}
-
-    # ЭКСПЕРИМЕНТ 1: Предобученная + Adam (10 эпох)
+    #ЭКСПЕРИМЕНТ 1: Предобученная + Adam (10 эпох)
     print("\n" + "=" * 50)
     print(" ЭКСПЕРИМЕНТ 1: Предобученная + Adam")
     print("=" * 50)
@@ -507,12 +596,30 @@ def main():
     exp1_start = time.time()
     model1 = create_model(pretrained=True, num_classes=120, device=device)
     model1 = train_model_unified(model1, train_loader, val_loader, device,
-                                 use_swa=False, num_epochs=30, is_pretrained=True)
+                                 use_swa=False, num_epochs=50, is_pretrained=True)
 
+    # Train метрики
+    print("\n📊 Train выборка:")
+    train_acc1, train_prec1, train_rec1 = calculate_metrics(model1, train_loader, device)
+    print(f"  Accuracy:  {train_acc1:.4f}")
+    print(f"  Precision: {train_prec1:.4f}")
+    print(f"  Recall:    {train_rec1:.4f}")
+
+    # Validation метрики
+    print("\n📊 Validation выборка:")
+    val_acc1, val_prec1, val_rec1 = calculate_metrics(model1, val_loader, device)
+    print(f"  Accuracy:  {val_acc1:.4f}")
+    print(f"  Precision: {val_prec1:.4f}")
+    print(f"  Recall:    {val_rec1:.4f}")
+
+    # Test метрики
+    print("\n📊 Test выборка:")
     test_acc1, test_prec1, test_rec1 = calculate_metrics(model1, test_loader, device)
-    results['Pretrained+Adam'] = {'accuracy': test_acc1, 'precision': test_prec1, 'recall': test_rec1}
+    print(f"  Accuracy:  {test_acc1:.4f}")
+    print(f"  Precision: {test_prec1:.4f}")
+    print(f"  Recall:    {test_rec1:.4f}")
 
-    # ЭКСПЕРИМЕНТ 2: Предобученная + Averaged Adam (10 эпох)
+    #ЭКСПЕРИМЕНТ 2: Предобученная + Averaged Adam (10 эпох)
     print("\n" + "=" * 50)
     print(" ЭКСПЕРИМЕНТ 2: Предобученная + Averaged Adam")
     print("=" * 50)
@@ -520,35 +627,60 @@ def main():
     exp2_start = time.time()
     model2 = create_model(pretrained=True)
     model2 = train_model_unified(model2, train_loader, val_loader, device,
-                                 use_swa=True, num_epochs=10, is_pretrained=True)
+                                 use_swa=True, num_epochs=50, is_pretrained=True)
 
+    # Train метрики
+    print("\n📊 Train выборка:")
+    train_acc2, train_prec2, train_rec2 = calculate_metrics(model2, train_loader, device)
+    print(f"  Accuracy:  {train_acc2:.4f}")
+    print(f"  Precision: {train_prec2:.4f}")
+    print(f"  Recall:    {train_rec2:.4f}")
+
+    # Validation метрики
+    print("\n📊 Validation выборка:")
+    val_acc2, val_prec2, val_rec2 = calculate_metrics(model2, val_loader, device)
+    print(f"  Accuracy:  {val_acc2:.4f}")
+    print(f"  Precision: {val_prec2:.4f}")
+    print(f"  Recall:    {val_rec2:.4f}")
+
+    # Test метрики
+    print("\n📊 Test выборка:")
     test_acc2, test_prec2, test_rec2 = calculate_metrics(model2, test_loader, device)
-    results['Pretrained+AveragedAdam'] = {'accuracy': test_acc2, 'precision': test_prec2, 'recall': test_rec2}
-    #
-    # ЭКСПЕРИМЕНТ 3: С нуля + Adam (10 эпох)
-    # print("\n" + "=" * 50)
-    # print(" ЭКСПЕРИМЕНТ 3: Обучение с нуля + Adam")
-    # print("=" * 50)
-    # print(" Примечание: ResNet50 с нуля требует 50+ эпох")
-    #
-    # exp3_start = time.time()
-    # model3 = create_model(pretrained=False)
-    # model3 = train_model_unified(model3, train_loader, val_loader, device,
-    #                              use_swa=False, num_epochs=10, is_pretrained=False)
-    #
-    # test_acc3, test_prec3, test_rec3 = calculate_metrics(model3, test_loader, device)
-    # results['Scratch+Adam'] = {'accuracy': test_acc3, 'precision': test_prec3, 'recall': test_rec3}
+    print(f"  Accuracy:  {test_acc2:.4f}")
+    print(f"  Precision: {test_prec2:.4f}")
+    print(f"  Recall:    {test_rec2:.4f}")
 
-    # РЕЗУЛЬТАТЫ
-    print("\n" + "=" * 60)
-    print(" ИТОГОВЫЕ РЕЗУЛЬТАТЫ")
-    print("=" * 60)
+    #ЭКСПЕРИМЕНТ 3: С нуля + Adam (10 эпох)
+    print("\n" + "=" * 50)
+    print(" ЭКСПЕРИМЕНТ 3: Обучение с нуля + Adam")
+    print("=" * 50)
+    print(" Примечание: ResNet50 с нуля требует 50+ эпох")
 
-    for name, metrics in results.items():
-        print(f"\n{name}:")
-        print(f"  Accuracy:  {metrics['accuracy']:.4f}")
-        print(f"  Precision: {metrics['precision']:.4f}")
-        print(f"  Recall:    {metrics['recall']:.4f}")
+    exp3_start = time.time()
+    model3 = create_model(pretrained=False)
+    model3 = train_model_unified(model3, train_loader, val_loader, device,
+                                 use_swa=False, num_epochs=80, is_pretrained=False)
+
+    # Train метрики
+    print("\n📊 Train выборка:")
+    train_acc3, train_prec3, train_rec3 = calculate_metrics(model3, train_loader, device)
+    print(f"  Accuracy:  {train_acc3:.4f}")
+    print(f"  Precision: {train_prec3:.4f}")
+    print(f"  Recall:    {train_rec3:.4f}")
+
+    # Validation метрики
+    print("\n📊 Validation выборка:")
+    val_acc3, val_prec3, val_rec3 = calculate_metrics(model3, val_loader, device)
+    print(f"  Accuracy:  {val_acc3:.4f}")
+    print(f"  Precision: {val_prec3:.4f}")
+    print(f"  Recall:    {val_rec3:.4f}")
+
+    # Test метрики
+    print("\n📊 Test выборка:")
+    test_acc3, test_prec3, test_rec3 = calculate_metrics(model3, test_loader, device)
+    print(f"  Accuracy:  {test_acc3:.4f}")
+    print(f"  Precision: {test_prec3:.4f}")
+    print(f"  Recall:    {test_rec3:.4f}")
 
     total_time = (time.time() - total_start) / 60
     print(f"\n ОБУЧЕНИЕ ЗАВЕРШЕНО ЗА {total_time:.1f} МИНУТ")
